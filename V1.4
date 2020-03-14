@@ -1,0 +1,359 @@
+/*
+ * 1/30/20 - V1.2
+ * First attempt of serial exchange protocol. 4 input version.
+ * 
+ * 1/31/20 - V1.3
+ * Building upon the V1.2 code. Reassigned pins to accomodate two SN74HC165 PISO shift registers. 
+ * These will allow 6 I/O pins to interface with 16 locations on the relia-lok.
+ * One PISO will read the fault register and the other will read the input enables. At the moment, the 
+ * instantaneous states will be read by 8 I/O pins to use available hardware efficiently. As currently set up,
+ * there is one spare pin to be used for interrupt triggering or general I/O. If more than one is needed, a third
+ * PISO will need to be added to free up additional general I/O pins.
+ * 
+ * 2/18/20 - V1.4
+ * Building upon V1.2 & V1.3. Setting up for the full 8 input/output version. 
+ * Added 3rd PISO. Freed up I/O pins, and allowed removal of 1/2 393 and OR gate. Now INT1 can be connected to ~Q of main flip-flop directly and ISR instantiated; this allows removal of AND/OR decision logic in STATE_CHANGE case.
+ * The other 1/2 393 is still a one-shot but is now connected to inverting buffer with 50 Ohm series termination for fast (1.5uS after valid fault signal) interfacing with other systems.
+ * Final version of the code for the breadboard circuit.
+ * 
+ */
+
+/*                                     ---------- COMMAND LIST ----------
+ *  Possible commands sent from control CPU to interlock. (End of line char: <\n>):
+ *  - 'RELIALOK?'      - Asks the device on COM port if this is a relia-lok.
+ *  - 'RESET?'         - Attempts to reset interlock. See below for return values.
+ *  - 'STATUS?'        - Query the current status of the interlock. Returns whether each input is enabled/disabled
+ *                       and it's current status (does it currently have a fault or is it okay). This is different than the fault register.
+ *  - 'FAULT_REG?'     - Requests the contents of the fault register. The 1 in this register indicate the input who caused
+ *                       the interlock to lock.
+ *  - 'DISABLE?'       - Disables interlock if active, without generating a fault condition. 
+ */
+
+/*
+ *  Possible messages sent from interlock to control CPU. Sent immediately after triggering event (either interlock changing state or query from CPU):
+ *  - 'MANUAL_RESET<\n>'                            - The interlock was reset manually via front panel push button.
+ *  
+ *  - 'FAULT<space>fault register contents<\n>'     - Fault occurred on one of the active inputs. Returns a byte with the following structure:
+ *                                                         Input one is LSbit, thus input eight is MSbit. 1 means fault, 0 means no fault.                     
+ *  == In response to 'RELIALOK?' ==
+ *  - 'OCTO-LOK<\n>'                                - When initializing the serial communication with the control CPU, 'OCTO-LOK'.
+ *  
+ *  == In response to 'RESET?' ==
+ *  - 'ACTIVE<\n>                                   - If interlock was already locked and active. 
+ *  - 'RESET_SUCCESS<\n>'                           - If interlock was successfully reset into the active state.
+ *  - 'RESET_FAIL<space>upperByte lowerByte<\n>'    - If interlock could not be locked due to an input currently having a fault. The upper
+ *                                                    and lower byte come from the 'currentStatus' 16 bit word and is structured as follows:
+ *                                               
+ *                                                    0b00 00 00 00 00 00 00 00   
+ *                                                      - Eight pairs, one for each input
+ *                                                      - MSbit pair is for input eight, thus LSbit pair is for input one. 
+ *                                                      - For each pair: 
+ *                                                        - Left bit indicates whether the input is enabled (1) or disabled (0).
+ *                                                        - Right bit indicates whether the input currently is OK (1) or has a fault (0). 
+ *                                                          (This reading is independent of the fault register contents).
+ *  == In response to 'STATUS?' ==
+ *  - 'STATUS<space>upperByte lowerByte'<\n>           - Updates and returns contents of 'currentStatus'. Structure of which is described by 'RESET_FAIL'.
+ *                                              
+ *  == In response to 'FAULT_REG?' ==
+ *  - 'FAULT_REG<space>fault register contents<\n>'    - Returns the contents of the fault register.
+ *  
+ *  == In response to 'DISABLE?' ==
+ *  - 'DISABLE_SUCCESS<\n>'                            - If the interlock was sucessfully disabled
+ *  - 'DISABLE_FAIL<\n>'                               - If the interlock was not successfully disabled
+ *  
+ */
+
+//===== Pin Assignments =====
+#define INTERLOCK_RESET   2
+#define INTERLOCK_FAULT   3
+#define remoteReset       4
+#define interlockActive   5
+#define ENABLE_SER        6
+#define ENABLE_CLK        7
+#define ENABLE_SHLD       8
+#define interlockDisable  9
+#define unusedPin0       10
+#define unusedPin1       11
+#define unusedPin2       12
+#define unusedPin3       13
+#define FREG_SER         14
+#define FREG_CLK         15
+#define FREG_SHLD        16
+#define CURRENT_SER      17
+#define CURRENT_CLK      18
+#define CURRENT_SHLD     19
+
+//===== Enumerations =====
+#define RECEIVE         1
+#define SEND            2
+// Receive commands
+#define RESET           1
+#define STATUS          2
+#define FAULT_REGISTER  3
+#define DISABLE         4
+#define MODEL           5
+// Send commands
+#define MANUAL_RESET    1
+#define FAULT           2 
+
+//===== General Variables =====
+uint16_t currentStatus = 0b0000000000000000;
+byte currentStates = 0b00000000;
+byte inputsEnabled = 0b11111111;  // Initialize assuming all inputs are enabled but with faults. 
+byte faults = 0b11111111;         // Actual states will be read in setup().
+
+//===== Semaphores =====
+byte comType = 0;
+byte receiveCommand = 0;
+byte sendCommand = 0;
+
+void setup() 
+{  
+
+  pinMode(unusedPin0, INPUT); // Tri-state unused pins to prevent excessive current flow since physical pins tied to GND.
+  pinMode(unusedPin1, INPUT);
+  pinMode(unusedPin2, INPUT);
+  pinMode(unusedPin3, INPUT);
+  
+  pinMode(INTERLOCK_RESET, INPUT);
+  pinMode(INTERLOCK_FAULT, INPUT);
+  pinMode(remoteReset, INPUT);  // Is an output. Set to INPUT to put pin in high-impedance state until needed. Then switched to OUTPUT and back.
+  pinMode(interlockActive, INPUT);
+  pinMode(ENABLE_SER, INPUT);
+  pinMode(ENABLE_CLK, OUTPUT);
+  pinMode(ENABLE_SHLD, OUTPUT);
+  pinMode(interlockDisable, INPUT); // Is an output. Set to INPUT to put pin in high-impedance state until needed. Then switched to OUTPUT and back.
+  pinMode(FREG_SER, INPUT);
+  pinMode(FREG_CLK, OUTPUT);
+  pinMode(FREG_SHLD, OUTPUT);
+  pinMode(CURRENT_SER, INPUT);
+  pinMode(CURRENT_CLK, OUTPUT);
+  pinMode(CURRENT_SHLD, OUTPUT);
+  
+  attachInterrupt(digitalPinToInterrupt(INTERLOCK_RESET), interlockActiveINT, RISING);
+  attachInterrupt(digitalPinToInterrupt(INTERLOCK_FAULT), interlockFaultINT, RISING);
+
+  Serial.begin(9600);
+
+  delay(1);  // Wait for circuit to stabilize
+  readCurrentStatus(); // Read initial states of inputs.
+  readFaultRegister();
+}
+
+void loop() 
+{
+  switch(comType)
+  {
+    case RECEIVE:
+      switch(receiveCommand)
+      {
+        case RESET:
+          resetInterlock(); // Message sending is handled within function
+          resetStateVariables();
+        break;
+        case STATUS:
+          readCurrentStatus();  // Gather information
+          sendMessage(F("STATUS"), currentStatus); // Send information
+          resetStateVariables();
+        break;
+        case FAULT_REGISTER:
+          readFaultRegister();
+          sendMessage(F("FAULT_REG"), faults);
+          resetStateVariables();
+        break;
+        case DISABLE:
+          disableInterlock(); // Message sending is handled within function        
+          resetStateVariables();
+        break;
+        case MODEL:
+          sendSingleEndedMessage(F("OCTO-LOK"));
+          resetStateVariables();
+        break;
+      }
+    break;
+    case SEND:
+      switch(sendCommand)
+      {
+        case MANUAL_RESET: // Interlock has been reset and is now active
+          sendSingleEndedMessage(F("MANUAL_RESET"));
+          resetStateVariables();
+        break;
+        case FAULT: // Interlock had a fault
+          readFaultRegister();
+          sendMessage(F("FAULT"), faults);
+          resetStateVariables();
+        break;
+      }
+    break;
+  }
+}
+
+// ========== Interrupt Service Routines ==========
+
+void serialEvent(void) // Automagically called when data is present in serial buffer from CPU
+{
+  String command = Serial.readStringUntil('\n');  // Read until newline char. The newline char is truncated from String.
+
+  comType = RECEIVE;
+  if (command.equals(F("RESET?"))) // Test received command and set appropriate semaphores. 
+    receiveCommand = RESET;
+  else if (command.equals(F("STATUS?")))
+    receiveCommand = STATUS;
+  else if (command.equals(F("FAULT_REG?")))
+    receiveCommand = FAULT_REGISTER;
+  else if (command.equals(F("DISABLE?")))
+    receiveCommand = DISABLE;
+  else if (command.equals(F("RELIALOK?")))
+    receiveCommand = MODEL;
+}
+
+void interlockActiveINT(void)
+{
+  comType = SEND;
+  sendCommand = MANUAL_RESET;
+}
+
+void interlockFaultINT(void)
+{
+  comType = SEND;
+  sendCommand = FAULT;
+}
+
+// ========== Functions ==========
+
+void resetStateVariables(void)
+{
+  comType = 0;
+  receiveCommand = 0;
+  sendCommand = 0;
+}
+
+void resetInterlock(void)
+{
+  if(!digitalRead(interlockActive)) // If interlock is not already active...
+  {
+    // Attempt to reset interlock
+    pinMode(remoteReset, OUTPUT); // Switch pin from High-Z state to OUTPUT
+    digitalWrite(remoteReset, HIGH);  // Try to activate it.
+    delay(1);
+    digitalWrite(remoteReset, LOW);
+    delay(1);
+    pinMode(remoteReset, INPUT);  // Return pin to High-Z state.
+    
+    if (!digitalRead(interlockActive))  // If it's still not active, 
+    {
+      readCurrentStatus();  // Find out why 
+      sendMessage(F("RESET_FAIL"), currentStatus); // and report to CPU.
+    } else
+      sendSingleEndedMessage(F("RESET_SUCCESS"));  // If it became active, celebrate and share the good news.
+  } else
+      sendSingleEndedMessage(F("ACTIVE"));  // Silly human, don't you have eyes.
+}
+
+void readCurrentStatus(void)  // Instantaneous status of all the inputs. 
+{
+  readCurrentStates();
+  readEnables();
+
+  uint8_t j = 0;
+  for (uint8_t i = 0; i <= 7; i++)
+  {
+    bitRead(currentStates, i) == 1 ? bitWrite(currentStatus, j, 1) : bitWrite(currentStatus, j, 0);
+    bitRead(inputsEnabled, i) == 1 ? bitWrite(currentStatus, (j+1), 1) : bitWrite(currentStatus, (j+1), 0); 
+    j += 2;
+  }
+}
+
+void readFaultRegister(void)
+{
+  delay(1);  // Give the circuit time to stabilize
+  digitalWrite(FREG_CLK, HIGH); 
+  digitalWrite(FREG_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
+  faults = shiftIn(FREG_SER, FREG_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  digitalWrite(FREG_SHLD, LOW);  // Return PISO to parallel state
+}
+
+void disableInterlock(void)
+{
+  if (digitalRead(interlockActive)) // If the interlock is active
+  {
+    // Try to deactive it
+    pinMode(interlockDisable, OUTPUT);  // Switch pin from High-Z state to OUTPUT
+    digitalWrite(remoteReset, HIGH);  // Try to activate it.
+    delay(1);
+    digitalWrite(interlockDisable, LOW);
+    delay(1);
+    pinMode(interlockDisable, INPUT); // Return pin to High-Z state.
+
+    if (!digitalRead(interlockActive))  // Check to make sure it's disabled
+      sendSingleEndedMessage(F("DISABLE_SUCCESS"));
+  } else
+      sendSingleEndedMessage(F("DEACTIVE"));
+}
+
+void readCurrentStates(void)
+{
+  delay(1);  // Give the circuit time to stabilize
+  digitalWrite(CURRENT_CLK, HIGH);  
+  digitalWrite(CURRENT_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
+  currentStates = shiftIn(CURRENT_SER, CURRENT_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  digitalWrite(CURRENT_SHLD, LOW);  // Return PISO to parallel state
+  for (int i = 7; i >= 0; i--)  // Flip values to make output data more intuitive
+  {
+    if (bitRead(currentStates, i))
+      bitWrite(currentStates, i, 0);
+    else
+      bitWrite(currentStates, i, 1);
+  }
+}
+
+void readEnables(void)
+{
+  delay(1);  // Give the circuit time to stabilize
+  digitalWrite(ENABLE_CLK, HIGH);  
+  digitalWrite(ENABLE_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
+  inputsEnabled = shiftIn(ENABLE_SER, ENABLE_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  digitalWrite(ENABLE_SHLD, LOW);  // Return PISO to parallel state
+
+  for (int i = 7; i >= 0; i--)  // Flip values to make output data more intuitive
+  {
+    if (bitRead(inputsEnabled, i))
+      bitWrite(inputsEnabled, i, 0);
+    else
+      bitWrite(inputsEnabled, i, 1);
+  }
+}
+
+void sendMessage(String message, byte b)  // To print the byte for debugging
+{
+  Serial.print(message);
+  Serial.write(" ");
+  for (int i = 7; i >= 0; i--)  // Need to count from 7 to 0 to print byte in correct order.
+  {
+    if (bitRead(b, i))
+      Serial.write("1");
+    else
+      Serial.write("0");
+  }
+  Serial.write("\n");
+}
+
+void sendMessage(String message, uint16_t b)  // To print the byte for debugging
+{
+  Serial.print(message);
+  Serial.write(" ");
+  for (int i = 15; i >= 0; i--) // Need to count from 15 to 0 to print word in correct order.
+  {
+    if (bitRead(b, i))
+      Serial.write("1");
+    else
+      Serial.write("0");
+  }
+  Serial.write("\n");
+}
+
+void sendSingleEndedMessage(String message)
+{
+  Serial.print(message);
+  Serial.write("\n");  
+}
