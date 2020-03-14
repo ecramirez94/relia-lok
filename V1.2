@@ -1,0 +1,233 @@
+/*
+ * 1/30/20
+ * First attempt of serial exchange protocol. 4 input version.
+ */
+
+/*           --- COMMAND LIST ---
+ *  Possible commands sent from control CPU to interlock:
+ *  - 'Reset'          - Attempts to reset interlock. Returns 'locked' for successful locking, or 'notReady' followed 
+ *                     by the ID number (ASCII coded) of the faulty input(s).
+ *  - 'CurrentStatus'  - Requests current status of the interlock. Returns ID number of each input followed by
+ *                     either 'OK', 'fault', or 'disabled' depending on the current state of the input.
+ *  - 'FaultRegister'  - Requests the contents of the fault register. If there is a fault, returns ID number of faulted 
+ *                     input. If no faults, then returns all zeros. Returns only 'Interlock Active' if interlock is active.
+ *  - 'Disable'        - Disables interlock if active. Returns 'disabled' if successful or 'off' if already disabled.
+ */
+
+/*
+ *  Possible messages sent from interlock to control CPU. Sent immediately after triggering event:
+ *  - 'ManualReset' - The interlock was reset manually via front panel push button.
+ *  - 'Fault'       - Fault occurred on one of the active inputs. Sends 'fault' followed by the ID number of 
+ *                    the input. 
+ *                     
+ */
+//===== Input Names =====
+String input[4] = {"Water Flow Switch", "Water Flow Meter", "Water Temperature", "Body Temperature"};
+
+//===== Pin Assignments =====
+#define stateChange     3
+#define remoteReset     4
+#define interlockActive 5
+#define testLight       7
+#define IN_1            10
+#define IN_2            11
+#define IN_3            12
+#define IN_4            13
+#define IN_1_EN         14
+#define IN_2_EN         15
+#define IN_3_EN         16
+#define IN_4_EN         17
+
+//===== Enumerations =====
+#define RECEIVE        1
+#define SEND           2
+// Remote commands
+#define RESET          1
+#define CURRENT_STATUS 2
+#define FAULT_REGISTER 3
+#define DISABLE        4
+// Output messages
+#define FAULT          1
+#define MANUAL_RESET   2
+
+//===== Input states =====
+bool IN_enabled[4] = {true, true, true, true};  // Initialize assuming all inputs are enabled but with faults. 
+bool IN_fault[4] = {true, true, true, true};    // Actual states will be read in setup().
+
+//===== General Variables =====
+int comType = 0;
+int receiveCommand = 0;
+int sendCommand = 0;
+
+void setup() 
+{  
+  pinMode(IN_1_EN, INPUT);
+  pinMode(IN_2_EN, INPUT);
+  pinMode(IN_3_EN, INPUT);
+  pinMode(IN_4_EN, INPUT);
+  pinMode(IN_1, INPUT);
+  pinMode(IN_2, INPUT);
+  pinMode(IN_3, INPUT);
+  pinMode(IN_4, INPUT);
+  pinMode(interlockActive, INPUT);
+  pinMode(stateChange, INPUT);
+  pinMode(remoteReset, OUTPUT);
+  //pinMode(testLight, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(stateChange), stateChangeINT, FALLING);
+
+  Serial.begin(9600);
+
+  readInputs(); // Read current state of inputs
+}
+
+void loop() 
+{
+  switch(comType)
+  {
+    case RECEIVE:
+      switch(receiveCommand)
+      {
+        case RESET:
+          resetInterlock();  
+        break;
+        case CURRENT_STATUS:
+          readCurrentStatus();
+        break;
+        case FAULT_REGISTER:
+
+        break;
+        case DISABLE:
+          Serial.println("Disabled bitch");
+        break;
+        default:
+    
+        break;
+      }
+    break;
+    case SEND:
+      switch(sendCommand)
+      {
+        case FAULT:
+          Serial.print("Fault Occurred on ");
+        break;
+        case MANUAL_RESET:
+          Serial.println("Manually reset\n");
+        break;
+        default:
+          
+        break;
+      }
+    break;
+    default:
+
+    break;
+  }
+ resetStateVariables();
+}
+
+//////////////////////// Functions ////////////////////////////
+
+void serialEvent(void) // Automagically called when data is present in serial buffer
+{
+  String command = Serial.readStringUntil('\n');
+
+  // Receive Commands
+  if (command.equals(F("Reset")))
+  {
+    comType = RECEIVE;
+    receiveCommand = RESET;
+  }
+  if (command.equals(F("Status")))
+  {
+    comType = RECEIVE;
+    receiveCommand = CURRENT_STATUS;
+  }
+  if (command.equals(F("Disable")))
+  {
+    comType = RECEIVE;
+    receiveCommand = DISABLE;
+  }
+  // Send Commands
+}
+
+void stateChangeINT(void)
+{
+  readInputs();
+
+  comType = SEND;
+  if ((IN_enabled[0] && IN_fault[0]) || (IN_enabled[1] && IN_fault[1]) || // Trigger fault response only if the input 
+      (IN_enabled[2] && IN_fault[2]) || (IN_enabled[3] && IN_fault[3]))   // is enabled && there is a fault. 
+    sendCommand = FAULT;
+  else
+    sendCommand = MANUAL_RESET;
+}
+
+void resetStateVariables(void)
+{
+  comType = 0;
+  receiveCommand = 0;
+  sendCommand = 0;
+}
+
+void readInputs(void)
+{
+  readInputsEN(); // Check which inputs are enabled or not
+
+  if (IN_enabled[0])
+    IN_fault[0] = digitalRead(IN_1);
+  if (IN_enabled[1])
+    IN_fault[1] = digitalRead(IN_2);
+  if (IN_enabled[2])
+    IN_fault[2] = digitalRead(IN_3);
+  if (IN_enabled[3])  
+    IN_fault[3] = digitalRead(IN_4);
+}
+
+void readInputsEN(void)
+{
+  IN_enabled[0] = !digitalRead(IN_1_EN);
+  IN_enabled[1] = !digitalRead(IN_2_EN);
+  IN_enabled[2] = !digitalRead(IN_3_EN);
+  IN_enabled[3] = !digitalRead(IN_4_EN);
+}
+
+void resetInterlock(void)
+{
+  if(!digitalRead(interlockActive)) // If interlock is not already active...
+  {
+    digitalWrite(remoteReset, HIGH);  // Try to activate it.
+    delay(100);
+    digitalWrite(remoteReset, LOW);
+    if (!digitalRead(interlockActive))  // If it's still not active, 
+    {
+      Serial.println(F("Reset Failed! Check: ")); // Find out why.
+      for (uint8_t i = 0; i <= 3; i++)
+      {
+        if (IN_fault[i])
+          Serial.println(input[i]);
+      }
+    } else
+        Serial.println(F("Reset Successful"));  
+  } else
+    Serial.println(F("Interlock is already active!"));
+    
+  Serial.println("");
+}
+
+void readCurrentStatus(void)  // Need to change this to instantaneous status. 
+{
+  readInputs();
+  Serial.println(F("Relia-Lok, Quad-Lok. Version 1.2"));
+  Serial.println(F("Current Status of Inputs"));
+  for (uint8_t i = 0; i <= 3; i++)
+  {
+    Serial.print(input[i] + F(" - "));
+    if (!IN_enabled[i])
+      Serial.println(F("Disabled"));
+    else if (!IN_fault[i]) 
+      Serial.println(F("OK"));
+    else
+      Serial.println(F("Fault"));
+  }
+  Serial.println("");
+}
