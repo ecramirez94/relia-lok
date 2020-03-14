@@ -1,0 +1,334 @@
+/*
+ * 1/30/20 - V1.2
+ * First attempt of serial exchange protocol. 4 input version.
+ * 1/31/20 - V1.3
+ * Building upon the V1.2 code. Reassigned pins to accomodate two SN74HC165 PISO shift registers. 
+ * These will allow 6 I/O pins to interface with 16 locations on the relia-lok.
+ * One PISO will read the fault register and the other will read the input enables. At the moment, the 
+ * instantaneous states will be read by 8 I/O pins to use available hardware efficiently. As currently set up,
+ * there is one spare pin to be used for interrupt triggering or general I/O. If more than one is needed, a third
+ * PISO will need to be added to free up additional general I/O pins.
+ * 
+ */
+
+/*                                     ---------- COMMAND LIST ----------
+ *  Possible commands sent from control CPU to interlock:
+ *  - 'RELIALOK?'      - Asks the device on COM port if this is a relia-lok.
+ *  - 'RESET?'         - Attempts to reset interlock. See below for return values.
+ *  - 'STATUS?'        - Query the current status of the interlock. Returns whether each input is enabled/disabled
+ *                       and it's current status (does it have a fault or is it okay). This is different than the fault register.
+ *  - 'F_REG?          - Requests the contents of the fault register. Any 1's in this register indicate the input who caused
+ *                       the interlock to lock.
+ *  - 'DISABLE?'       - Disables interlock if active, without generating a fault condition. 
+ */
+
+/*
+ *  Possible messages sent from interlock to control CPU. Sent immediately after triggering event:
+ *  - 'MANRES'                            - The interlock was reset manually via front panel push button.
+ *  
+ *  - 'FAULT<space>fault register byte'   - Fault occurred on one of the active inputs. Returns a byte with the following structure:
+ *                                            Input one is LSbit, thus input eight is MSbit. 1 means fault, 0 means no fault.                     
+ *  == In response to 'RELIALOK?' ==
+ *  - 'QUAD' or 'OCTO'                    - When initializing the serial communication with the control CPU, return the model
+ *                                            of Relia-Lok. 'QUAD' for Quad-Lok, 'OCTO' for Octo-Lok. 
+ *  
+ *  == In response to 'RESET?' ==
+ *  - 'ACTIVE'                              - If interlock was already locked. 
+ *  - 'RESSUCC'                             - If interlock was successfully reset.
+ *  - 'RESFAIL<space>upperByte lowerByte'   - If interlock could not be locked due to an input currently having a fault. The upper
+ *                                            and lower byte come from the 'currentStatus' 16 bit word and is structured as follows:
+ *                                               
+ *                                              0b00 00 00 00 00 00 00 00   
+ *                                              - Eight pairs, one for each input
+ *                                              - MSbit pair is for input eight, thus LSbit pair is for input one. 
+ *                                              - For each pair: 
+ *                                                  - Left bit indicates whether the input is enabled (1) or disabled (0).
+ *                                                  - Right bit indicates whether the input currently is OK (1) or has a fault (0). 
+ *                                                    (This reading is independent of the fault register contents).
+ *  == In response to 'STATUS?' ==
+ *  - 'CURRSTAT<space>upperByte lowerByte'  - Updates and returns contents of 'currentStatus'. Structure of which is described by 'RESFAIL'.
+ *                                              
+ *  == In response to 'F_REG' ==
+ *  - 'F_REG<space>faultRegister'  - Returns the contents of the fault register.
+ *  
+ *  == In response to 'DISABLE' ==
+ *  - 'DISSUCC'                    - If the interlock was sucessfully disabled
+ *  - 'DISFAIL'                    - If the interlock was not successfully disabled
+ *  
+ */
+
+//===== Pin Assignments =====
+#define stateChange      2
+#define interlockDisable 3
+#define remoteReset      4
+#define interlockActive  5
+#define IN1_ENABLE       6
+#define IN2_ENABLE       7
+#define IN3_ENABLE       8
+#define IN4_ENABLE       9
+#define IN5_ENABLE       10
+#define IN6_ENABLE       11
+#define IN7_ENABLE       12
+#define IN8_ENABLE       13
+#define FREG_SER         14
+#define FREG_CLK         15
+#define FREG_SHLD        16
+#define CURRENT_SER      17
+#define CURRENT_CLK      18
+#define CURRENT_SHLD     19
+
+//===== Enumerations =====
+#define RECEIVE         1
+#define SEND            2
+// Receive commands
+#define RESET           1
+#define STATUS          2
+#define FAULT_REGISTER  3
+#define DISABLE         4
+#define MODEL           5
+// Send commands
+#define STATE_CHANGE    1
+#define MANUAL_RESET    2 
+
+//===== General Variables =====
+//uint16_t currentStatus = 0b0000000000000000;
+byte currentStatus = 0b00000000;
+byte currentStates = 0b00000000;
+byte inputsEnabled = 0b11111111;  // Initialize assuming all inputs are enabled but with faults. 
+byte faults = 0b11111111;         // Actual states will be read in setup().
+
+String modelNum = "QUAD";
+
+//===== Semaphores =====
+int comType = 0;
+int receiveCommand = 0;
+int sendCommand = 0;
+
+void setup() 
+{  
+  pinMode(IN1_ENABLE, INPUT);
+  pinMode(IN2_ENABLE, INPUT);
+  pinMode(IN3_ENABLE, INPUT);
+  pinMode(IN4_ENABLE, INPUT);
+  pinMode(IN5_ENABLE, INPUT);
+  pinMode(IN6_ENABLE, INPUT);
+  pinMode(IN7_ENABLE, INPUT);
+  pinMode(IN8_ENABLE, INPUT);
+  pinMode(FREG_SER, INPUT);
+  pinMode(FREG_CLK, OUTPUT);
+  pinMode(FREG_SHLD, OUTPUT);
+  pinMode(CURRENT_SER, INPUT);
+  pinMode(CURRENT_CLK, OUTPUT);
+  pinMode(CURRENT_SHLD, OUTPUT);
+  pinMode(interlockActive, INPUT);
+  pinMode(interlockDisable, INPUT); // Is an output. Set to INPUT to put pin in high-impedance state until needed. Then switched to OUTPUT and back.
+  pinMode(stateChange, INPUT);
+  pinMode(remoteReset, INPUT);  // Is an output. Set to INPUT to put pin in high-impedance state until needed. Then switched to OUTPUT and back.
+  attachInterrupt(digitalPinToInterrupt(stateChange), stateChangeINT, FALLING);
+
+  Serial.begin(9600);
+
+  delay(1);  // Wait for circuit to stabilize
+  readCurrentStatus(); // Read initial states of inputs.
+  readFaultRegister();
+}
+
+void loop() 
+{
+  switch(comType)
+  {
+    case RECEIVE:
+      switch(receiveCommand)
+      {
+        case RESET:
+          resetInterlock();  
+          resetStateVariables();
+        break;
+        case STATUS:
+          readCurrentStatus();
+          resetStateVariables();
+        break;
+        case FAULT_REGISTER:
+          readFaultRegister();
+          resetStateVariables();
+        break;
+        case DISABLE:
+          if (digitalRead(interlockActive)) // If the interlock is active
+          {
+            pinMode(interlockDisable, OUTPUT);  // Try to deactive it
+            digitalWrite(interlockDisable, LOW);
+            delay(1);
+            pinMode(interlockDisable, INPUT);
+  
+            if (!digitalRead(interlockActive))  // Check to make sure it's disabled
+              Serial.write("DISSUCC");  // DISable SUCCessful
+          } else
+              Serial.write("DISFAIL");  // DISable FAILed
+        
+        resetStateVariables();
+        break;
+        case MODEL:
+//          Serial.print(modelNum);   
+          Serial.write("QUAD\n");  
+          resetStateVariables();
+        break;
+      }
+    break;
+    case SEND:
+      switch(sendCommand)
+      {
+        case STATE_CHANGE: // Interlock either had a fault or was manually reset
+          readEnables();
+          readFaultRegister();
+          
+          if ((bitRead(inputsEnabled, 0) && bitRead(faults, 0)) || 
+              (bitRead(inputsEnabled, 1) && bitRead(faults, 1)) ||     // Include input in trigger only if the input 
+              (bitRead(inputsEnabled, 2) && bitRead(faults, 2)) || 
+              (bitRead(inputsEnabled, 3) && bitRead(faults, 3)) ||
+              (bitRead(inputsEnabled, 4) && bitRead(faults, 4)) || 
+              (bitRead(inputsEnabled, 5) && bitRead(faults, 5)) ||     // Include input in trigger only if the input 
+              (bitRead(inputsEnabled, 6) && bitRead(faults, 6)) ||     // is enabled && there is a fault.
+              (bitRead(inputsEnabled, 7) && bitRead(faults, 7)))       
+          {
+            Serial.write("FAULT "); 
+            printByte(faults);  // To print the byte for debugging 
+//            Serial.write(faults);
+//            Serial.write('\n');
+          }
+          else
+            Serial.write("MANRES\n");
+
+        resetStateVariables();
+        break;
+      }
+    break;
+  }
+}
+
+// ========== Interrupt Service Routines ==========
+
+void serialEvent(void) // Automagically called when data is present in serial buffer from CPU
+{
+  String command = Serial.readStringUntil('\n');  // Read until newline char. The newline char is truncated from String.
+
+  comType = RECEIVE;
+  if (command.equals(F("RESET?"))) // Test received command and set appropriate semaphores. 
+    receiveCommand = RESET;
+  else if (command.equals(F("STATUS?")))
+    receiveCommand = STATUS;
+  else if (command.equals(F("F_REG?")))
+    receiveCommand = FAULT_REGISTER;
+  else if (command.equals(F("DISABLE?")))
+    receiveCommand = DISABLE;
+  else if (command.equals(F("RELIALOK?")))
+    receiveCommand = MODEL;
+}
+
+void stateChangeINT(void)
+{
+  comType = SEND;
+  sendCommand = STATE_CHANGE;
+}
+
+// ========== Functions ==========
+
+void resetStateVariables(void)
+{
+  comType = 0;
+  receiveCommand = 0;
+  sendCommand = 0;
+}
+
+void resetInterlock(void)
+{
+  if(!digitalRead(interlockActive)) // If interlock is not already active...
+  {
+    pinMode(remoteReset, OUTPUT); // Switch pin from High-Z state to OUTPUT
+    digitalWrite(remoteReset, HIGH);  // Try to activate it.
+    delay(1);
+    digitalWrite(remoteReset, LOW);
+    delay(1);
+    pinMode(remoteReset, INPUT);  // Return pin to High-Z state.
+    
+    if (!digitalRead(interlockActive))  // If it's still not active, 
+    {
+      readCurrentStates();  // Find out why and report to CPU.
+      Serial.write("RESFAIL ");
+//      printByte(currentStates); // To print the byte for debugging
+      Serial.write(currentStates);
+      Serial.write('\n');
+    } else
+        Serial.write("RESSUCC");  // If it became active, celebrate and share the good news.
+  } else
+    Serial.write("ACTIVE");  // Silly human, don't you have eyes.
+}
+
+void readCurrentStatus(void)  // Instantaneous status of all the inputs. 
+{
+  readCurrentStates();
+  readEnables();
+
+  uint8_t j = 0;
+  for (uint8_t i = 0; i <= 3; i++)  // ****%$%^#$$# Change 3 to 7 
+  {
+    bitRead(currentStates, i) == 1 ? bitWrite(currentStatus, j, 1) : bitWrite(currentStatus, j, 0);
+    bitRead(inputsEnabled, i) == 1 ? bitWrite(currentStatus, (j+1), 1) : bitWrite(currentStatus, (j+1), 0); 
+    j += 2;
+  }
+  printByte(currentStatus);
+}
+
+void readFaultRegister(void)
+{
+  delay(1);  // Give the circuit time to stabilize
+  digitalWrite(FREG_CLK, HIGH); 
+  digitalWrite(FREG_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
+  faults = shiftIn(FREG_SER, FREG_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  digitalWrite(FREG_SHLD, LOW);  // Return PISO to parallel state
+  printByte(faults);
+}
+
+void readCurrentStates(void)
+{
+  delay(1);  // Give the circuit time to stabilize
+  digitalWrite(CURRENT_CLK, HIGH);  
+  digitalWrite(CURRENT_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
+  currentStates = shiftIn(CURRENT_SER, CURRENT_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  digitalWrite(CURRENT_SHLD, LOW);  // Return PISO to parallel state
+}
+
+void readEnables(void)
+{
+  !digitalRead(IN1_ENABLE) ? bitWrite(inputsEnabled, 0, 1) : bitWrite(inputsEnabled, 0, 0);
+  !digitalRead(IN2_ENABLE) ? bitWrite(inputsEnabled, 1, 1) : bitWrite(inputsEnabled, 1, 0);
+  !digitalRead(IN3_ENABLE) ? bitWrite(inputsEnabled, 2, 1) : bitWrite(inputsEnabled, 2, 0);
+  !digitalRead(IN4_ENABLE) ? bitWrite(inputsEnabled, 3, 1) : bitWrite(inputsEnabled, 3, 0);
+  !digitalRead(IN5_ENABLE) ? bitWrite(inputsEnabled, 4, 1) : bitWrite(inputsEnabled, 4, 0);
+  !digitalRead(IN6_ENABLE) ? bitWrite(inputsEnabled, 5, 1) : bitWrite(inputsEnabled, 5, 0);
+  !digitalRead(IN7_ENABLE) ? bitWrite(inputsEnabled, 6, 1) : bitWrite(inputsEnabled, 6, 0);
+  !digitalRead(IN8_ENABLE) ? bitWrite(inputsEnabled, 7, 1) : bitWrite(inputsEnabled, 7, 0);
+}
+
+void printByte(byte b)  // To print the byte for debugging
+{
+  for (int i = 7; i >= 0; i--)  // Need to count from 7 to 0 to print byte in correct order.
+  {
+    if (bitRead(b, i))
+      Serial.write("1");
+    else
+      Serial.write("0");
+  }
+  Serial.write("\n");
+}
+
+void printByte(uint16_t b)  // To print the byte for debugging
+{
+  for (int i = 15; i >= 0; i--) // Need to count from 15 to 0 to print word in correct order.
+  {
+    if (bitRead(b, i))
+      Serial.write("1");
+    else
+      Serial.write("0");
+  }
+  Serial.write("\n");
+}
