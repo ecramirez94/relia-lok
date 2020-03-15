@@ -94,13 +94,8 @@
 #define MODEL           5
 // Send commands
 #define MANUAL_RESET    1
-#define FAULT           2 
-
-//===== General Variables =====
-uint16_t currentStatus = 0b0000000000000000;
-byte currentStates = 0b00000000;
-byte inputsEnabled = 0b11111111;  // Initialize assuming all inputs are enabled but with faults. 
-byte faults = 0b11111111;         // Actual states will be read in setup().
+#define MANUAL_DISABLE  2
+#define FAULT           3 
 
 //===== Semaphores =====
 byte comType = 0;
@@ -136,8 +131,6 @@ void setup()
   Serial.begin(9600);
 
   delay(1);  // Wait for circuit to stabilize
-  readCurrentStatus(); // Read initial states of inputs.
-  readFaultRegister();
 }
 
 void loop() 
@@ -152,13 +145,11 @@ void loop()
           resetStateVariables();
         break;
         case STATUS:
-          readCurrentStatus();  // Gather information
-          sendMessage(F("STATUS"), currentStatus); // Send information
+          sendMessage(F("STATUS"), readCurrentStatus()); // Send information
           resetStateVariables();
         break;
         case FAULT_REGISTER:
-          readFaultRegister();
-          sendMessage(F("FAULT_REG"), faults);
+          sendMessage(F("FAULT_REG"), readFaultRegister());
           resetStateVariables();
         break;
         case DISABLE:
@@ -174,13 +165,16 @@ void loop()
     case SEND:
       switch(sendCommand)
       {
-        case MANUAL_RESET: // Interlock has been reset and is now active
+        case MANUAL_RESET: // Interlock was reset from the front panel
           sendSingleEndedMessage(F("MANUAL_RESET"));
           resetStateVariables();
         break;
+        case MANUAL_DISABLE:  // Interlock was disabled from the front panel
+          sendSingleEndedMessage(F("MANUAL_DISABLE"));
+          resetStateVariables();
+        break;
         case FAULT: // Interlock had a fault
-          readFaultRegister();
-          sendMessage(F("FAULT"), faults);
+          sendMessage(F("FAULT"), readFaultRegister());
           resetStateVariables();
         break;
       }
@@ -215,8 +209,12 @@ void interlockActiveINT(void)
 
 void interlockFaultINT(void)
 {
+  if(readFaultRegister() == 0)
+    sendCommand = MANUAL_DISABLE;
+  else
+    sendCommand = FAULT;  
+  
   comType = SEND;
-  sendCommand = FAULT;
 }
 
 // ========== Functions ==========
@@ -243,17 +241,18 @@ void resetInterlock(void)
     if (!digitalRead(interlockActive))  // If it's still not active, 
     {
       readCurrentStatus();  // Find out why 
-      sendMessage(F("RESET_FAIL"), currentStatus); // and report to CPU.
+      sendMessage(F("RESET_FAIL"), readCurrentStatus()); // and report to CPU.
     } else
       sendSingleEndedMessage(F("RESET_SUCCESS"));  // If it became active, celebrate and share the good news.
   } else
       sendSingleEndedMessage(F("ACTIVE"));  // Silly human, don't you have eyes.
 }
 
-void readCurrentStatus(void)  // Instantaneous status of all the inputs. 
+uint16_t readCurrentStatus(void)  // Instantaneous status of all the inputs. 
 {
-  readCurrentStates();
-  readEnables();
+  uint8_t currentStates = readCurrentStates();
+  uint8_t inputsEnabled = readEnables();
+  uint16_t currentStatus = 0;
 
   uint8_t j = 0;
   for (uint8_t i = 0; i <= 7; i++)
@@ -262,15 +261,18 @@ void readCurrentStatus(void)  // Instantaneous status of all the inputs.
     bitRead(inputsEnabled, i) == 1 ? bitWrite(currentStatus, (j+1), 1) : bitWrite(currentStatus, (j+1), 0); 
     j += 2;
   }
+  return currentStatus;
 }
 
-void readFaultRegister(void)
+uint8_t readFaultRegister(void)
 {
+  uint8_t faults = 0;
   delay(1);  // Give the circuit time to stabilize
   digitalWrite(FREG_CLK, HIGH); 
   digitalWrite(FREG_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
   faults = shiftIn(FREG_SER, FREG_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
   digitalWrite(FREG_SHLD, LOW);  // Return PISO to parallel state
+  return faults;
 }
 
 void disableInterlock(void)
@@ -278,12 +280,14 @@ void disableInterlock(void)
   if (digitalRead(interlockActive)) // If the interlock is active
   {
     // Try to deactive it
+    cli();
     pinMode(interlockDisable, OUTPUT);  // Switch pin from High-Z state to OUTPUT
     digitalWrite(remoteReset, HIGH);  // Try to activate it.
     delay(1);
     digitalWrite(interlockDisable, LOW);
     delay(1);
     pinMode(interlockDisable, INPUT); // Return pin to High-Z state.
+    sei();
 
     if (!digitalRead(interlockActive))  // Check to make sure it's disabled
       sendSingleEndedMessage(F("DISABLE_SUCCESS"));
@@ -291,37 +295,44 @@ void disableInterlock(void)
       sendSingleEndedMessage(F("DEACTIVE"));
 }
 
-void readCurrentStates(void)
+uint8_t readCurrentStates(void)
 {
+  uint8_t currentStates = 0;
+  
   delay(1);  // Give the circuit time to stabilize
   digitalWrite(CURRENT_CLK, HIGH);  
   digitalWrite(CURRENT_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
   currentStates = shiftIn(CURRENT_SER, CURRENT_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
   digitalWrite(CURRENT_SHLD, LOW);  // Return PISO to parallel state
-  for (int i = 7; i >= 0; i--)  // Flip values to make output data more intuitive
+  
+  for (int i = 7; i >= 0; i--)  // Invert values to make output data more intuitive
   {
     if (bitRead(currentStates, i))
       bitWrite(currentStates, i, 0);
     else
       bitWrite(currentStates, i, 1);
   }
+  return currentStates;
 }
 
-void readEnables(void)
+uint8_t readEnables(void)
 {
+  uint8_t inputsEnabled = 0;
+  
   delay(1);  // Give the circuit time to stabilize
   digitalWrite(ENABLE_CLK, HIGH);  
   digitalWrite(ENABLE_SHLD, HIGH); // Lockout inputs of PISO, prepare chip to shift data
-  inputsEnabled = shiftIn(ENABLE_SER, ENABLE_CLK, MSBFIRST); // Shift in data from PISO. Input 1 is LSbit
+  inputsEnabled = shiftIn(ENABLE_SER, ENABLE_CLK, LSBFIRST); // Shift in data from PISO. Input 1 is LSbit
   digitalWrite(ENABLE_SHLD, LOW);  // Return PISO to parallel state
 
-  for (int i = 7; i >= 0; i--)  // Flip values to make output data more intuitive
+  for (int i = 7; i >= 0; i--)  // Invert values to make output data more intuitive
   {
     if (bitRead(inputsEnabled, i))
       bitWrite(inputsEnabled, i, 0);
     else
       bitWrite(inputsEnabled, i, 1);
   }
+  return inputsEnabled;
 }
 
 void sendMessage(String message, byte b)  // To print the byte for debugging
